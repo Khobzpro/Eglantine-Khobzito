@@ -99,6 +99,11 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain();
+    /// Whether the back executed everything sent so far (front thread only).
+    [[nodiscard]] bool Idle() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache == write_position;
+    }
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
