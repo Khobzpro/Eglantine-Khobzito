@@ -48,12 +48,15 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
     return ReadSemaphoreWord(dma_pusher.memory_manager, *dma_pusher.rasterizer, address);
 }
 
-// EDEN_NX2_ACQUIRE_FASTPATH=0: every acquire waits for the split's back thread to finish
-// everything queued before checking it.
+// Off by default: a deferred acquire is registered unarmed until the back thread checks it, so
+// a release the fencing thread writes in that window (5 then 6 before an AcquireEqual 5 is
+// checked) is missed and the channel waits forever. Every acquire waits for the split's back
+// thread to finish everything queued before checking it, as in build-135.
+// EDEN_NX2_ACQUIRE_FASTPATH=1 turns the deferred check on.
 bool AcquireFastPath() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_ACQUIRE_FASTPATH");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
