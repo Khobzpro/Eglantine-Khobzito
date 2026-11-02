@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
+
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -109,6 +113,21 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat form
                 .depth = 1,
             },
     };
+}
+
+// Host presents of Switch 2 programs are timed by default (EDEN_NX2_FRAME_STATS=0 off, =1 for
+// every program): the gap between two frames handed to the driver, and how long acquiring a
+// swapchain image (which also waits for the frame pacing mode, and recreates the swapchain when
+// needed) and presenting blocked.
+bool HostFrameStatsEnabled() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_FRAME_STATS");
+        if (value == nullptr || value[0] == '\0') {
+            return -1;
+        }
+        return value[0] == '0' ? 0 : 1;
+    }();
+    return mode < 0 ? Settings::CurrentProgramIsSwitch2() : mode == 1;
 }
 
 } // Anonymous namespace
@@ -434,9 +453,12 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         RecreateSwapchain(frame);
     }
 
+    const bool frame_stats = HostFrameStatsEnabled();
+    const auto acquire_start = std::chrono::steady_clock::now();
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
     }
+    const auto acquired = std::chrono::steady_clock::now();
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
     cmdbuf.Begin({
@@ -582,7 +604,38 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+    const auto present_start = std::chrono::steady_clock::now();
     swapchain.Present(render_semaphore);
+    if (frame_stats) {
+        const auto presented = std::chrono::steady_clock::now();
+        const auto to_us = [](auto d) {
+            return static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+        };
+        std::scoped_lock lk{host_stats.mutex};
+        const long long acquire_us = to_us(acquired - acquire_start);
+        const long long present_us = to_us(presented - present_start);
+        host_stats.acquire_us += acquire_us;
+        host_stats.present_us += present_us;
+        host_stats.max_acquire_us = (std::max)(host_stats.max_acquire_us, acquire_us);
+        host_stats.max_present_us = (std::max)(host_stats.max_present_us, present_us);
+        const bool first = host_stats.last_present == std::chrono::steady_clock::time_point{};
+        const long long gap_us = first ? 0 : to_us(present_start - host_stats.last_present);
+        host_stats.last_present = present_start;
+        if (!first && gap_us <= Common::FrameTimeStats::MaxFrameUs &&
+            host_stats.frames.Add(gap_us)) {
+            constexpr long long N = Common::FrameTimeStats::Window;
+            LOG_INFO(Render_Vulkan,
+                     "Host presents: {}; acquire (incl. frame pacing mode wait) {} us (max {}), "
+                     "present {} us (max {}), {}",
+                     host_stats.frames.TakeSummary(), host_stats.acquire_us / N,
+                     host_stats.max_acquire_us, host_stats.present_us / N,
+                     host_stats.max_present_us,
+                     use_present_thread ? "present thread" : "GPU thread");
+            host_stats.acquire_us = host_stats.present_us = 0;
+            host_stats.max_acquire_us = host_stats.max_present_us = 0;
+        }
+    }
 }
 
 } // namespace Vulkan
