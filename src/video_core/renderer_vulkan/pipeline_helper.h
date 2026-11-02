@@ -259,7 +259,8 @@ public:
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : GraphicsPushConstantStages()),
+                is_compute ? VkShaderStageFlags{VK_SHADER_STAGE_COMPUTE_BIT}
+                           : GraphicsPushConstantStages()),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
