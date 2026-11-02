@@ -18,6 +18,7 @@ class System;
 
 namespace Tegra::Engines {
 class EngineInterface;
+class Maxwell3D;
 }
 
 namespace VideoCommon {
@@ -160,6 +161,8 @@ private:
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
+    void CallBackMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                        bool is_last);
 
     Core::System* system{};
     bool active{};
@@ -177,6 +180,7 @@ private:
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    Tegra::Engines::Maxwell3D* back_maxwell_3d{}; ///< back_engine, when it is Maxwell3D
 
     static GpuSplit instance;
 
