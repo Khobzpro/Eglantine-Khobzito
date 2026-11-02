@@ -12,6 +12,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "common/slot_vector.h"
 #include "common/assert.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -69,10 +70,21 @@ public:
         invalidated = false;
         //
         descriptors.resize(num_descriptors);
+        resolved_ids.resize(num_descriptors);
+    }
+
+    /// The view or sampler the descriptor at `index` resolved to when it was last read as new.
+    /// Valid while Read() reports it unchanged: Invalidate() and Refresh() clear the read bits.
+    [[nodiscard]] Common::SlotId Resolved(u32 index) const noexcept {
+        return resolved_ids[index];
+    }
+    void SetResolved(u32 index, Common::SlotId id) noexcept {
+        resolved_ids[index] = id;
     }
 
     std::vector<u64> read_descriptors;
     std::vector<T> descriptors;
+    std::vector<Common::SlotId> resolved_ids;
     GPUVAddr current_gpu_addr{};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
