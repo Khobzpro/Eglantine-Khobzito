@@ -7,11 +7,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
+#include "common/frame_time_stats.h"
 #include "common/polyfill_thread.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -109,6 +111,14 @@ private:
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};
+
+    // Host present timing (CopyToSwapchainImpl), logged every FrameTimeStats::Window presents.
+    struct HostPresentStats {
+        std::mutex mutex;
+        Common::FrameTimeStats frames;
+        std::chrono::steady_clock::time_point last_present{};
+        long long acquire_us{}, present_us{}, max_acquire_us{}, max_present_us{};
+    } host_stats;
 };
 
 } // namespace Vulkan
