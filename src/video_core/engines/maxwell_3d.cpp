@@ -337,7 +337,26 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+namespace {
+// EDEN_NX2_INSTANCE_FLUSH=1: draw the deferred instances of an instance loop before any write
+// other than the loop's own methods (title 1's trees drew with other meshes' transforms: NVN's
+// draw macros reset the base instance right after the loop). Off by default: upstream reverted it
+// (ac22c4087d) without a stated reason, a write inside a loop would draw its instances early,
+// and the check sits on every 3D register write (~6 million a second on title 1).
+const bool g_flush_deferred_instances = [] {
+    const char* value = std::getenv("EDEN_NX2_INSTANCE_FLUSH");
+    return value != nullptr && value[0] == '1';
+}();
+} // Anonymous namespace
+
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+    // The instances after the first are drawn together once their loop ends, and they must see
+    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
+    // c[0][0x644]) right after the loop, before the macro returns.
+    if (g_flush_deferred_instances && draw_manager.HasDeferredDraw() &&
+        !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+        draw_manager.DrawDeferred(*this);
+    }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
@@ -528,6 +547,11 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     if (method >= MacroRegistersStart) {
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
+    }
+    // As in ProcessDirtyRegisters: the paths below write without it.
+    if (g_flush_deferred_instances && draw_manager.HasDeferredDraw() &&
+        !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+        draw_manager.DrawDeferred(*this);
     }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.buffer):

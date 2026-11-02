@@ -30,6 +30,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_mesh.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -170,6 +171,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     } else {
         info.previous_stage_stores.mask.set();
     }
+    if (previous_program && previous_program->stage == Shader::Stage::Mesh) {
+        for (const u32 line : previous_program->mesh.primitive_lines) {
+            const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+            if (Shader::IR::IsGeneric(attribute)) {
+                info.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            }
+        }
+    }
     const Shader::Stage stage{program.stage};
     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
@@ -229,6 +238,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             ASSERT(false);
             return Shader::TessSpacing::Equal;
         }();
+        break;
+    case Shader::Stage::Mesh:
+        info.convert_depth_mode = gl_ndc;
         break;
     case Shader::Stage::Geometry:
         if (program.output_topology == Shader::OutputTopology::PointList) {
@@ -345,6 +357,31 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
     return std::memcmp(&rhs, this, Size()) == 0;
 }
 
+namespace {
+// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. Eden's copy on top
+// only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
+// of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
+// no slower without it.
+// EDEN_NX2_KEEP_VK_PIPELINE_CACHE=1 keeps Eden's VkPipelineCache on these drivers too (A/B, or a
+// driver shader cache that is disabled or too small).
+bool DriverCachesPipelines(const Device& device) {
+    static const bool keep = [] {
+        const char* value = std::getenv("EDEN_NX2_KEEP_VK_PIPELINE_CACHE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (keep) {
+        return false;
+    }
+    switch (device.GetDriverID()) {
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+    case VK_DRIVER_ID_AMD_PROPRIETARY:
+        return true;
+    default:
+        return false;
+    }
+}
+} // Anonymous namespace
+
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              const Device& device_, Scheduler& scheduler_,
                              DescriptorPool& descriptor_pool_,
@@ -358,13 +395,22 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
-      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
+      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+                                !DriverCachesPipelines(device_)},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
+    // EDEN_NX2_MESH=1: task/mesh programs are translated and drawn only when the device enabled
+    // VK_EXT_mesh_shader (the device leaves it off without the variable).
+    VideoCommon::Nx2::mesh_enabled = device.IsExtMeshShaderSupported();
+    if (VideoCommon::Nx2::mesh_requested) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_MESH=1: task/mesh programs {}",
+                 VideoCommon::Nx2::mesh_enabled ? "enabled (VK_EXT_mesh_shader)"
+                                                : "stay skipped: no VK_EXT_mesh_shader");
+    }
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
@@ -378,7 +424,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                            Shader::Stage::TessellationEval) |
         subgroup_stage_bit(VK_SHADER_STAGE_GEOMETRY_BIT, Shader::Stage::Geometry) |
         subgroup_stage_bit(VK_SHADER_STAGE_FRAGMENT_BIT, Shader::Stage::Fragment) |
-        subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute)};
+        subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute) |
+        subgroup_stage_bit(VK_SHADER_STAGE_TASK_BIT_EXT, Shader::Stage::Task) |
+        subgroup_stage_bit(VK_SHADER_STAGE_MESH_BIT_EXT, Shader::Stage::Mesh)};
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
     }
@@ -564,6 +612,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
+    // A next session may run another renderer (OpenGL has no task/mesh path).
+    VideoCommon::Nx2::mesh_enabled = false;
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
@@ -668,6 +718,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+
+        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
+        // any that were.
+        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                return env.ShaderStage() == Shader::Stage::Task ||
+                       env.ShaderStage() == Shader::Stage::Mesh;
+            })) {
+            return;
+        }
 
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
@@ -985,7 +1044,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ++env_index;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        try {
+            // Walks the program for the dump; the one that failed may fail here again, and an
+            // exception leaving this handler would end the process.
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        } catch (const Shader::Exception&) {
+        }
         env.Dump(hash, key.unique_hashes[index]);
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
@@ -1033,6 +1097,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
+    if (pipeline->IsMeshPipeline()) {
+        // Not stored: task and mesh programs are translated with the mesh registers, which the
+        // cache format does not carry. The few of them rebuild quickly from the driver cache.
+        QueueVulkanPipelineCacheFlush();
+        return pipeline;
+    }
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
@@ -1055,7 +1125,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
-    ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+    ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
+                           shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();

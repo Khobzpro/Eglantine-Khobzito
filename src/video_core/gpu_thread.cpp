@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/assert.h"
@@ -73,11 +75,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    // EDEN_NX2_PENDING_SLEEP_US=<us> sets the sleep (1000 by default; a Windows
+                    // sleep lasts at least one timer period); 0 keeps yielding instead.
+                    static const long long pending_sleep_us = [] {
+                        const char* value = std::getenv("EDEN_NX2_PENDING_SLEEP_US");
+                        char* end = nullptr;
+                        const long long us = value != nullptr ? std::strtoll(value, &end, 10) : 0;
+                        if (value == nullptr || end == value || *end != '\0') {
+                            return 1000LL; // unset or not a number: the default
+                        }
+                        return std::clamp(us, 0LL, 100'000LL);
+                    }();
+                    if (pending_sleep_us == 0 || std::chrono::steady_clock::now() - last_progress <
+                                                     std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        std::this_thread::sleep_for(std::chrono::microseconds{pending_sleep_us});
                     }
                     continue;
                 }

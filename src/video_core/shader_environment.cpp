@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -33,6 +34,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_mesh.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -322,22 +324,100 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     return entry;
 }
 
-void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
+namespace {
+
+// Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time.
+// The reads do not flush the GPU caches first (ReadBlockUnsafe): the previous per-instruction
+// ReadBlock did, once per instruction. An instruction that is not inside a fully mapped page is
+// left to the caller.
+class NativeInstructionReader {
+public:
+    using Instruction = Shader::Ampere::Instruction;
+    static constexpr GPUVAddr PageSize = 0x1000;
+
+    explicit NativeInstructionReader(Tegra::MemoryManager& gpu_memory_)
+        : gpu_memory{gpu_memory_} {}
+
+    /// Copies the instruction at `address` into `out`, loading its page first if needed.
+    /// Returns false when the instruction is not inside a fully mapped page.
+    bool TryRead(GPUVAddr address, Instruction& out) {
+        if (!Holds(address)) {
+            LoadFrom(address);
+        }
+        if (!Holds(address)) {
+            return false;
+        }
+        out = page[(address - page_begin) / sizeof(Instruction)];
+        return true;
+    }
+
+private:
+    bool Holds(GPUVAddr address) const {
+        return address >= page_begin && address + sizeof(Instruction) <= page_end;
+    }
+
+    // Loads from `address` up to the next page boundary; loads nothing if that range is not
+    // fully mapped.
+    void LoadFrom(GPUVAddr address) {
+        const GPUVAddr next_page = (address | (PageSize - 1)) + 1;
+        const GPUVAddr length = next_page - address;
+        page_begin = address;
+        page_end = address;
+        if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
+            gpu_memory.ReadBlockUnsafe(address, page.data(), length);
+            page_end = next_page;
+        }
+    }
+
+    Tegra::MemoryManager& gpu_memory;
+    std::array<Instruction, PageSize / sizeof(Instruction)> page;
+    GPUVAddr page_begin{};
+    GPUVAddr page_end{};
+};
+
+} // Anonymous namespace
+
+// A native program is captured and lowered once, when the shader cache first meets it. The
+// environments built later for its pipelines receive that result instead of lowering again.
+void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
+                                              u32 source_header_size, bool task_or_mesh) {
+    if (!lowered) {
+        lowered = LowerNativeCode(source_header_size, task_or_mesh);
+    }
+    if (lowered->texture_bound != ~0U) {
+        // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.
+        texture_bound = lowered->texture_bound;
+    }
+    native_source_size = lowered->source_size;
+    code = lowered->code;
+    cached_lowest = 0;
+    cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+    lowered_native = std::move(lowered);
+}
+
+std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32 source_header_size,
+                                                                            bool task_or_mesh) {
     using Shader::Ampere::Instruction;
     const u32 native_header_size = source_header_size;
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
     std::vector<Instruction> native;
     Shader::Ampere::ProgramCaptureState capture;
+    NativeInstructionReader reader{*gpu_memory};
     for (u32 index = 0; index < maximum_instructions; ++index) {
         const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
-        if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
-            // The program may end before a branch target past its last EXIT (the capture can't
-            // tell); stop at the mapping's end and let the lowering judge what was captured.
-            if (!native.empty()) break;
-            throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
+        Instruction instruction;
+        if (!reader.TryRead(address, instruction)) {
+            // Not inside a fully mapped page: check and read this one instruction on its own.
+            if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
+                // The program may end before a branch target past its last EXIT (the capture
+                // can't tell); stop at the mapping's end and let the lowering judge what was
+                // captured.
+                if (!native.empty()) break;
+                throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
+            }
+            gpu_memory->ReadBlockUnsafe(address, &instruction, sizeof(instruction));
         }
-        auto& instruction = native.emplace_back();
-        gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+        native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
         if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
             if (const char* dir = std::getenv("EDEN_NX2_SHADER_DUMP")) {
@@ -354,7 +434,7 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, task_or_mesh);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -439,39 +519,47 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
             program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],
             words[1], words[2], words[3]);
     }
-    if (lowered.required_texture_buffer != ~0U) {
-        // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.
-        texture_bound = lowered.required_texture_buffer;
-    }
-    native_source_size = native_header_size + lowered.source_size;
-    code.resize(sizeof(sph) / sizeof(u64));
-    std::memcpy(code.data(), &sph, sizeof(sph));
+    auto result = std::make_shared<LoweredNativeCode>();
+    result->texture_bound = lowered.required_texture_buffer;
+    result->source_size = native_header_size + lowered.source_size;
+    auto& lowered_code = result->code;
+    lowered_code.resize(sizeof(sph) / sizeof(u64));
+    std::memcpy(lowered_code.data(), &sph, sizeof(sph));
     for (const u64 instruction : lowered.instructions) {
-        if ((code.size() * sizeof(u64)) % 32 == 0) {
-            code.push_back(0); // Maxwell scheduling word, absent from native instructions.
+        if ((lowered_code.size() * sizeof(u64)) % 32 == 0) {
+            lowered_code.push_back(0); // Maxwell scheduling word, absent from native instructions.
         }
-        code.push_back(instruction);
+        lowered_code.push_back(instruction);
     }
     // Keep the original padding ABI, then retain the native address map as
     // unreachable data. Existing disk-cache serialization carries it with code.
-    code.push_back(0);
-    Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
-    cached_lowest = 0;
-    cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+    lowered_code.push_back(0);
+    Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
     LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
-             program_base, native_source_size, lowered.instructions.size());
+              program_base, result->source_size, lowered.instructions.size());
+    return result;
 }
 
 GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          Tegra::MemoryManager& gpu_memory_,
                                          Maxwell::ShaderType program, GPUVAddr program_base_,
-                                         u32 start_address_)
+                                         u32 start_address_,
+                                         std::shared_ptr<const LoweredNativeCode> lowered_native_)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
     gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
-    if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
+    const auto& regs{maxwell3d->regs};
+    const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
+    // Task and mesh programs: the task in the vertex slot, its mesh program in the tessellation
+    // slot (without a task, the mesh program is in the vertex slot). EDEN_NX2_MESH=1 with
+    // VK_EXT_mesh_shader only: otherwise the tessellation slot stays rejected as before.
+    const bool mesh_slot{VideoCommon::Nx2::mesh_enabled && native && regs.IsMeshEnabled() &&
+                         (program == Maxwell::ShaderType::VertexB ||
+                          program == Maxwell::ShaderType::Tessellation)};
+    if (native) {
+        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
+            !mesh_slot) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
@@ -484,7 +572,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         }
-        InitializeNativeCode();
+        InitializeNativeCode(std::move(lowered_native_), 128, mesh_slot);
     }
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
@@ -515,6 +603,19 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     default:
         ASSERT_MSG(false, "Invalid program={}", program);
         break;
+    }
+    if (mesh_slot) {
+        const bool has_task{regs.IsShaderConfigEnabled(Maxwell::ShaderType::Tessellation)};
+        stage = program == Maxwell::ShaderType::VertexB && has_task ? Shader::Stage::Task
+                                                                    : Shader::Stage::Mesh;
+        mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
+                          regs.reg_array[Maxwell::MeshInitShader]};
+        if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
+            const auto& geometry{regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
+            const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
+                                   geometry.reserved[1]};
+            gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
+        }
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
@@ -594,7 +695,8 @@ u32 GraphicsEnvironment::ReadViewportTransformState() {
 
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                       u32 start_address_)
+                                       u32 start_address_,
+                                       std::shared_ptr<const LoweredNativeCode> lowered_native_)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, kepler_compute{
                                                                           &kepler_compute_} {
     const auto& qmd{kepler_compute->launch_description};
@@ -607,7 +709,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
-        InitializeNativeCode(0);
+        InitializeNativeCode(std::move(lowered_native_), 0);
         start_address = sizeof(sph);
     }
 }
@@ -712,7 +814,8 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
     }
-    is_proprietary_driver = texture_bound == 2;
+    // Native programs fold bank 1 reads as they did when they were built.
+    is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {

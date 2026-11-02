@@ -6,6 +6,7 @@
 
 #include "common/common_types.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_mesh.h"
 
 #define OFF(field_name) MAXWELL3D_REG_INDEX(field_name)
 #define NUM(field_name) (sizeof(::Tegra::Engines::Maxwell3D::Regs::field_name) / (sizeof(u32)))
@@ -64,6 +65,11 @@ void SetupDirtyRenderTargets(Maxwell3D::DirtyState::Tables& tables) {
 void SetupDirtyShaders(Maxwell3D::DirtyState::Tables& tables) {
     FillBlock(tables[0], OFF(pipelines), NUM(pipelines[0]) * Maxwell3D::Regs::MaxShaderProgram,
               Shaders);
+    // Task and mesh programs are translated with the mesh registers (EDEN_NX2_MESH=1 only; the
+    // four registers are padding in Regs, no other flag uses them).
+    if (VideoCommon::Nx2::mesh_requested) {
+        FillBlock(tables[1], Maxwell3D::Regs::MeshControl, 4, Shaders);
+    }
 }
 } // Anonymous namespace
 

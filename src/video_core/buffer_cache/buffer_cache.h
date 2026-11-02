@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
 
@@ -141,9 +142,10 @@ void BufferCache<P>::TickFrame() {
         // title 1's buffers were ~200 MiB of an 8 GB GPU's ~6.8 GB in use, yet this collector
         // ran aggressively every frame on the device-wide figure, evicting up to 64 buffers (and
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
-        // Collect when the buffers themselves are large.
-        if (buffer_bytes >= 1_GiB) {
-            RunGarbageCollector(buffer_bytes >= 2_GiB);
+        // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
+        // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
+        if (buffer_bytes >= 512_MiB) {
+            RunGarbageCollector(buffer_bytes >= 1_GiB);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);
@@ -291,6 +293,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
+        }
     }
     const auto& copy = copies[0];
     src_buffer.MarkUsage(copy.src_offset, copy.size);
@@ -1646,6 +1651,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         uncommitted_gpu_modified_ranges.Add(device_addr, size);
     } else {
         ArmReadTraps(device_addr, size);
+    }
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        Tegra::Nx2MarkGpuWritten(device_addr, size);
     }
 }
 

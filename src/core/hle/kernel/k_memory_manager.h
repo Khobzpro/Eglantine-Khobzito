@@ -92,6 +92,7 @@ public:
             {
                 KScopedLightLock lk(m_pool_locks[static_cast<size_t>(manager.GetPool())]);
                 manager.OpenFirst(address, cur_pages);
+                this->MarkHandedOut(address, cur_pages);
             }
 
             num_pages -= cur_pages;
@@ -108,6 +109,7 @@ public:
             {
                 KScopedLightLock lk(m_pool_locks[static_cast<size_t>(manager.GetPool())]);
                 manager.Close(address, cur_pages);
+                this->MarkReturned(address, cur_pages);
             }
 
             num_pages -= cur_pages;
@@ -333,6 +335,12 @@ private:
     };
 
 private:
+    // Tells the host backing that pages left the allocator (their first reference was opened), so
+    // that a later clear of them is no longer skipped as memory that is still zero.
+    void MarkHandedOut(KPhysicalAddress address, size_t num_pages);
+    // The other half: closed pages (freed or not) may hold data from now on.
+    void MarkReturned(KPhysicalAddress address, size_t num_pages);
+
     Impl& GetManager(KPhysicalAddress address) {
         return m_managers[m_memory_layout.GetPhysicalLinearRegion(address).GetAttributes()];
     }

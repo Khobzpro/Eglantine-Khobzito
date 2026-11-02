@@ -51,15 +51,20 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
+#include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <random>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/settings.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -740,6 +745,7 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
         impl.reset();
     }
 #endif
+    InitializePageBitmaps();
 }
 
 HostMemory::~HostMemory() {
@@ -799,7 +805,120 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
-void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+namespace {
+
+// EDEN_NX2_LAZY_ZERO: unset = Switch 2 programs only, 0 = never, 1 = every program.
+bool LazyZeroEnabled() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_LAZY_ZERO");
+        if (value == nullptr || value[0] == '\0') {
+            return -1;
+        }
+        return value[0] == '0' ? 0 : 1;
+    }();
+    return mode < 0 ? Settings::CurrentProgramIsSwitch2() : mode == 1;
+}
+
+// Calls fn(word, mask) for each bitmap word the pages [first, first + count) fall in.
+template <typename Fn>
+void ForEachPageWord(size_t first, size_t count, Fn&& fn) {
+    const size_t end = first + count;
+    for (size_t page = first; page < end;) {
+        const size_t bit = page % 64;
+        const size_t bits = (std::min)(64 - bit, end - page);
+        const u64 mask = bits == 64 ? ~u64{0} : ((u64{1} << bits) - 1) << bit;
+        fn(page / 64, mask);
+        page += bits;
+    }
+}
+
+std::atomic<u64> lazy_zero_skipped_bytes{};
+std::atomic<u64> lazy_zero_filled_bytes{};
+
+} // Anonymous namespace
+
+void HostMemory::InitializePageBitmaps() {
+    if (backing_base == nullptr) {
+        return;
+    }
+    // Every way the backing is created (pagefile-backed section, memfd, anonymous mapping,
+    // VirtualAlloc) starts with zero-filled pages that take no host memory until written.
+    page_bitmap_words = Common::DivCeil(backing_size / PageAlignment, size_t{64});
+    never_handed_out = std::make_unique<std::atomic<u64>[]>(page_bitmap_words);
+    handed_out_zero = std::make_unique<std::atomic<u64>[]>(page_bitmap_words);
+    for (size_t i = 0; i < page_bitmap_words; ++i) {
+        never_handed_out[i].store(~u64{0}, std::memory_order_relaxed);
+        handed_out_zero[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+bool HostMemory::GetBackingPages(size_t physical_offset, size_t length, size_t& first,
+                                 size_t& count) const {
+    if (page_bitmap_words == 0 || length == 0) {
+        return false;
+    }
+    // Outside the backing (a layout larger than the backing): no bit to read or update, and the
+    // caller falls back to what it did before (a plain fill).
+    const size_t num_pages = backing_size / PageAlignment;
+    first = physical_offset / PageAlignment;
+    const size_t last = (physical_offset + length - 1) / PageAlignment;
+    if (physical_offset + length < physical_offset || last >= num_pages) {
+        LOG_ERROR(HW_Memory, "Backing range {:#x}+{:#x} is outside the {:#x}-byte backing",
+                  physical_offset, length, backing_size);
+        return false;
+    }
+    count = last - first + 1;
+    return true;
+}
+
+void HostMemory::MarkBackingHandedOut(size_t physical_offset, size_t length) {
+    size_t first, count;
+    if (!GetBackingPages(physical_offset, length, first, count)) {
+        return;
+    }
+    // The caller owns these pages (it holds their pool's lock); other bits of a word may change
+    // under us, so every update is one atomic operation on this range's bits.
+    ForEachPageWord(first, count, [&](size_t word, u64 mask) {
+        const u64 still_zero =
+            never_handed_out[word].fetch_and(~mask, std::memory_order_acq_rel) & mask;
+        handed_out_zero[word].fetch_and(~mask, std::memory_order_acq_rel);
+        handed_out_zero[word].fetch_or(still_zero, std::memory_order_acq_rel);
+    });
+}
+
+void HostMemory::MarkBackingReturned(size_t physical_offset, size_t length) {
+    size_t first, count;
+    if (!GetBackingPages(physical_offset, length, first, count)) {
+        return;
+    }
+    // Whatever their owner did with them, these pages may hold data from now on.
+    ForEachPageWord(first, count, [&](size_t word, u64 mask) {
+        handed_out_zero[word].fetch_and(~mask, std::memory_order_acq_rel);
+    });
+}
+
+void HostMemory::MarkBackingNotZero(size_t physical_offset, size_t length) {
+    if (physical_offset >= backing_size) {
+        return;
+    }
+    length = (std::min)(length, backing_size - physical_offset);
+    size_t first, count;
+    if (!GetBackingPages(physical_offset, length, first, count)) {
+        return;
+    }
+    ForEachPageWord(first, count, [&](size_t word, u64 mask) {
+        never_handed_out[word].fetch_and(~mask, std::memory_order_acq_rel);
+        handed_out_zero[word].fetch_and(~mask, std::memory_order_acq_rel);
+    });
+}
+
+void HostMemory::MarkAllBackingReturned() {
+    for (size_t i = 0; i < page_bitmap_words; ++i) {
+        handed_out_zero[i].store(0, std::memory_order_release);
+    }
+}
+
+void HostMemory::FillBackingRange(size_t physical_offset, size_t length, u32 fill_value) {
 #ifdef __linux__
     const size_t first = AlignUp(physical_offset, PageAlignment);
     const size_t last = AlignDown(physical_offset + length, PageAlignment);
@@ -814,6 +933,69 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     }
 #endif
     std::memset(backing_base + physical_offset, fill_value, length);
+}
+
+void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+    if (length == 0) {
+        return;
+    }
+    size_t first, count;
+    if (!GetBackingPages(physical_offset, length, first, count)) {
+        FillBackingRange(physical_offset, length, fill_value);
+        return;
+    }
+    // Pages only partly covered can't be skipped; they are filled, and their bits cleared.
+    const bool aligned = physical_offset % PageAlignment == 0 && length % PageAlignment == 0;
+    const bool may_skip = aligned && fill_value == 0 && LazyZeroEnabled();
+
+    size_t run_start = 0;
+    size_t run_pages = 0;
+    size_t skipped_pages = 0;
+    const auto flush_run = [&] {
+        if (run_pages != 0) {
+            FillBackingRange(run_start * PageAlignment, run_pages * PageAlignment, fill_value);
+            run_pages = 0;
+        }
+    };
+    ForEachPageWord(first, count, [&](size_t word, u64 mask) {
+        const u64 zero = (never_handed_out[word].fetch_and(~mask, std::memory_order_acq_rel) |
+                          handed_out_zero[word].fetch_and(~mask, std::memory_order_acq_rel)) &
+                         mask;
+        if (!may_skip) {
+            return;
+        }
+        for (u64 bits = mask; bits != 0; bits &= bits - 1) {
+            const size_t page = word * 64 + static_cast<size_t>(std::countr_zero(bits));
+            if ((zero >> (page % 64)) & 1) {
+                flush_run();
+                ++skipped_pages;
+            } else if (run_pages != 0 && run_start + run_pages == page) {
+                ++run_pages;
+            } else {
+                flush_run();
+                run_start = page;
+                run_pages = 1;
+            }
+        }
+    });
+    if (!may_skip) {
+        FillBackingRange(physical_offset, length, fill_value);
+        return;
+    }
+    flush_run();
+
+    const u64 skipped = u64{skipped_pages} * PageAlignment;
+    lazy_zero_filled_bytes.fetch_add(length - skipped, std::memory_order_relaxed);
+    if (skipped == 0) {
+        return;
+    }
+    // One line per GiB of guest memory that was left untouched.
+    const u64 before = lazy_zero_skipped_bytes.fetch_add(skipped, std::memory_order_relaxed);
+    if ((before >> 30) != ((before + skipped) >> 30)) {
+        LOG_INFO(HW_Memory, "New guest memory: {} MiB left untouched (still zero), {} MiB filled",
+                 (before + skipped) >> 20,
+                 lazy_zero_filled_bytes.load(std::memory_order_relaxed) >> 20);
+    }
 }
 
 void HostMemory::EnableDirectMappedAddress() {

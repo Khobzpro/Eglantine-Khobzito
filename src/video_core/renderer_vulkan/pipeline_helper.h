@@ -15,12 +15,23 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/nx2_mesh.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
+
+/// Stages the graphics push constant range covers: every graphics stage, plus task and mesh when
+/// those programs are enabled (EDEN_NX2_MESH=1 with VK_EXT_mesh_shader). Layouts and pushes use
+/// the same flags; without mesh support this is VK_SHADER_STAGE_ALL_GRAPHICS as before.
+inline VkShaderStageFlags GraphicsPushConstantStages() {
+    return VideoCommon::Nx2::mesh_enabled
+               ? VkShaderStageFlags{VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                    VK_SHADER_STAGE_MESH_BIT_EXT}
+               : VkShaderStageFlags{VK_SHADER_STAGE_ALL_GRAPHICS};
+}
 
 using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
 
@@ -248,7 +259,7 @@ public:
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
+                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : GraphicsPushConstantStages()),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),

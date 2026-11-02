@@ -47,7 +47,30 @@ KMemoryManager::KMemoryManager(Core::System& system)
           KLightLock{system.Kernel()},
       } {}
 
+void KMemoryManager::MarkHandedOut(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.MarkBackingHandedOut(
+        GetInteger(address) - Core::DramMemoryMap::Base, num_pages * PageSize);
+}
+
+void KMemoryManager::MarkReturned(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.MarkBackingReturned(
+        GetInteger(address) - Core::DramMemoryMap::Base, num_pages * PageSize);
+}
+
 void KMemoryManager::Initialize(KVirtualAddress management_region, size_t management_region_size) {
+    // The backing outlives a game (System keeps DeviceMemory between boots), and the previous
+    // game's pages may never have been closed: none of them counts as zero any more.
+    m_system.DeviceMemory().buffer.MarkAllBackingReturned();
+    // Outside the user pools the kernel writes DRAM directly (slab heaps, the pools' management
+    // data), and with another memory layout those pages can be pool pages next time.
+    for (const auto& it : m_system.Kernel().MemoryLayout().GetPhysicalMemoryRegionTree()) {
+        if (it.IsDerivedFrom(KMemoryRegionType_Dram) &&
+            !it.IsDerivedFrom(KMemoryRegionType_DramUserPool) &&
+            it.GetAddress() >= Core::DramMemoryMap::Base) {
+            m_system.DeviceMemory().buffer.MarkBackingNotZero(
+                it.GetAddress() - Core::DramMemoryMap::Base, it.GetSize());
+        }
+    }
 
     // Clear the management region to zero.
     const KVirtualAddress management_region_end = management_region + management_region_size;
@@ -143,6 +166,7 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
 
                 // Open/reserve the ini memory.
                 manager.OpenFirst(ini_start, ini_size / PageSize);
+                this->MarkHandedOut(ini_start, ini_size / PageSize);
                 reserved_sizes[it.GetAttributes()] += ini_size;
 
                 // Free memory after the ini to the heap.
@@ -242,6 +266,7 @@ KPhysicalAddress KMemoryManager::AllocateAndOpenContinuous(size_t num_pages, siz
 
     // Open the first reference to the pages.
     chosen_manager->OpenFirst(allocated_block, num_pages);
+    this->MarkHandedOut(allocated_block, num_pages);
 
     return allocated_block;
 }
@@ -328,6 +353,7 @@ Result KMemoryManager::AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 op
             const size_t cur_pages =
                 (std::min)(remaining_pages, manager.GetPageOffsetToEnd(cur_address));
             manager.OpenFirst(cur_address, cur_pages);
+            this->MarkHandedOut(cur_address, cur_pages);
 
             // Advance.
             cur_address += cur_pages * PageSize;
