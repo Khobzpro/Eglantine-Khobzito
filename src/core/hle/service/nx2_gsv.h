@@ -26,6 +26,7 @@
 
 #include "common/alignment.h"
 #include "common/div_ceil.h"
+#include "common/frame_time_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -639,8 +640,10 @@ private:
             } else if (const auto address = BackGpuOnlyRegion(start, size)) {
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size);
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
-                                  "({} MiB of GPU-only memory in use, peak {} MiB)",
-                         start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+                                  "({} MiB of GPU-only memory in use, peak {} MiB, {} MiB waiting "
+                                  "for the GPU to be returned; {} created again without a 215)",
+                         start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20,
+                         PendingReleaseBytesLocked() >> 20, m_recreated_regions);
             }
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
@@ -761,6 +764,15 @@ private:
         return true;
     }
 
+    // Bytes of destroyed backings whose pages are not returned yet. Needs m_region_mutex.
+    u64 PendingReleaseBytesLocked() const {
+        u64 bytes = 0;
+        for (const auto& released : m_released_regions) {
+            bytes += released.region.size;
+        }
+        return bytes;
+    }
+
     // Returns the pages of destroyed regions the GPU thread is done with to the kernel.
     void FreeReleasedRegions() {
         auto* const process = system.ApplicationProcess();
@@ -859,9 +871,55 @@ private:
         if (!backing) {
             return std::nullopt;
         }
+        ReleaseRecreatedBacking(gpu_address, size);
         const u64 address = backing->address;
         RegisterGpuOnlyBacking(gpu_address, std::move(*backing));
         return address;
+    }
+
+    // Title 1 creates the same GPU-only region again from the same start with another size, with
+    // no 215 in between (300 MB -> 600 MB -> 1 GB, 122 times in 25 minutes; Djihads80/Eglantine
+    // PR #212, by CloudP4bbs / Paulo Rossatto). RegisterGpuOnlyBacking then overwrote the entry,
+    // leaving the old backing mapped in the alias code region with its pages never closed: the
+    // GPU-only total grew from 250 MiB to 6.5 GiB in one session. Release the old backing the way
+    // 215 does, and return its pages once the GPU thread is past this point (FreeReleasedRegions,
+    // which also takes it off m_gpu_only_bytes, once). The range the new region covers is not
+    // unmapped: Registry::Unmap reaches the GPU in order (RunInOrder) while the caller's MapAt of
+    // the new backing is immediate, so it would land after it and cut the new region. MapAt
+    // replaces that part; only a tail the new region no longer covers is unmapped. Only on this
+    // 214 path, a service thread: RunInOrder must not be called from the GPU thread (sparse
+    // blocks). EDEN_NX2_RECREATE_RELEASE=0 keeps the old behaviour. Needs m_region_mutex.
+    void ReleaseRecreatedBacking(u64 gpu_address, u64 new_size) {
+        const auto it = m_gpu_only_regions.find(gpu_address);
+        // A sparse region at that start keys its first block here: those blocks are mapped
+        // another way (BackSparse) and released by 215 only.
+        if (it == m_gpu_only_regions.end() || m_sparse_regions.contains(gpu_address)) {
+            return;
+        }
+        static const bool release = [] {
+            const char* value = std::getenv("EDEN_NX2_RECREATE_RELEASE");
+            return value == nullptr || value[0] != '0';
+        }();
+        ++m_recreated_regions;
+        if (m_recreated_regions <= 8 || (m_recreated_regions % 64) == 0) {
+            LOG_INFO(Service, "nx2:gpu 214 region at {:#x} created again over its {} MiB backing "
+                              "without a 215 ({} times){}",
+                     gpu_address, it->second.size >> 20, m_recreated_regions,
+                     release ? ", old backing released" : "");
+        }
+        if (!release) {
+            return;
+        }
+        if (it->second.size > new_size) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address + new_size,
+                                                               it->second.size - new_size);
+        }
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
+                                                                    it->second.size);
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+        m_released_regions.push_back({std::move(it->second), done});
+        m_gpu_only_regions.erase(it);
     }
 
     // Runs before a GPU-side write that may land in a sparse region (Tegra::Nx2BackSparseWrite,
@@ -1334,6 +1392,7 @@ private:
     }
 
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now
+    u64 m_recreated_regions{};   ///< 214 over a live backing, without a 215 first
     u64 m_gpu_only_peak{};
     std::atomic<u64> m_alias_hint{}; ///< 2 MiB slot after the last backing in the alias code region
     /// Regions are created and destroyed on the service thread and backed on the GPU thread.
@@ -1758,6 +1817,16 @@ private:
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                // The averages above hide uneven pacing; this logs the distribution (percentiles,
+                // frames over 18/20/34/50/100 ms) every 600 frames. EDEN_NX2_FRAME_STATS=0 off.
+                static const bool frame_stats = [] {
+                    const char* value = std::getenv("EDEN_NX2_FRAME_STATS");
+                    return value == nullptr || value[0] != '0';
+                }();
+                if (frame_stats && frame <= Common::FrameTimeStats::MaxFrameUs &&
+                    m_frame_times.Add(frame)) {
+                    LOG_INFO(Service, "nx2:vi2 game frames: {}", m_frame_times.TakeSummary());
+                }
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
@@ -1788,6 +1857,7 @@ private:
         u32 presents{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
+    Common::FrameTimeStats m_frame_times;
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
 
@@ -1825,9 +1895,20 @@ private:
             // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
             // sleep held that core for the whole wait: game threads scheduled there ran only
             // between presents (Fortune's Weave's loader read one RomFS block per frame).
-            const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(m_next_vblank - now);
-            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
-                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+            // EDEN_NX2_PACE_HOST_SLEEP=1 sleeps on the host instead, as before build 121 (A/B of
+            // frame pacing; it holds guest core 3 for the wait).
+            static const bool host_sleep = [] {
+                const char* value = std::getenv("EDEN_NX2_PACE_HOST_SLEEP");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (host_sleep) {
+                std::this_thread::sleep_until(m_next_vblank);
+            } else {
+                const auto wait =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(m_next_vblank - now);
+                static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                    kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+            }
         }
         m_next_vblank += interval;
     }

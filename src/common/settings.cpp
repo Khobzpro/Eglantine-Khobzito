@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <version>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
@@ -225,14 +226,15 @@ u64 GetCurrentProgramID() {
     return current_program_id;
 }
 
-static bool current_program_is_switch2 = false;
+// Read on render and present threads, written when a program loads.
+static std::atomic<bool> current_program_is_switch2{false};
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
-    current_program_is_switch2 = is_switch2;
+    current_program_is_switch2.store(is_switch2, std::memory_order_relaxed);
 }
 
 bool CurrentProgramIsSwitch2() {
-    return current_program_is_switch2;
+    return current_program_is_switch2.load(std::memory_order_relaxed);
 }
 
 static std::optional<AstcRecompression> astc_recompression_override;
